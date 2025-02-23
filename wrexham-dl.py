@@ -93,7 +93,7 @@ def download(media_id: str, *, media_type: str, ytdlp_options: dict = None):
 
     while True:
 
-        metadata, headers = load_metadata(media_id)
+        metadata, headers = prepare_session(media_id)
 
         filename = f"{metadata['name']}.ts"
         filename = filename.replace('/', '_')
@@ -136,7 +136,7 @@ def load_event(media_id: str):
     return response['itemData'][0]
 
 
-def load_metadata(media_id: str):
+def prepare_session(media_id: str):
     id_token, access_token, refresh_token = extract_cookies_from_browser()
     assert id_token is not None, 'Unable to extract cognito tokens from cookies.'
 
@@ -148,14 +148,19 @@ def load_metadata(media_id: str):
 
     while True:
         try:
+
             headers = {
                 'authorization': f'Bearer {id_token}',
                 'user-agent': user_agent,
                 'x-api-key': api_key,
             }
+
+            refresh_sso(id_token)
+
             response = requests.get(f'https://api.playback.streamamg.com/v1/entry/{media_id}', headers=headers)
             response.raise_for_status()
             return response.json(), headers
+
         except RequestException as e:
             if e.response.status_code == 401:
                 error = e.response.json()
@@ -163,7 +168,6 @@ def load_metadata(media_id: str):
                     claims = jwt.get_unverified_claims(id_token)
                     assert int(claims['exp']) < timegm(datetime.now(tz=timezone.utc).utctimetuple()), 'Token has not expired, but is still invalid.'
                     id_token, access_token, refresh_token = refresh_tokens(id_token, refresh_token)
-                    refresh_sso(id_token)
                     continue
                 if error['reason'] == 'TOO_MANY_DEVICES':  # may error if chrome is in middle of updating
                     user_agent = adjust_user_agent_version(user_agent, -1)
