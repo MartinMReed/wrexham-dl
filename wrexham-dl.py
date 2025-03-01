@@ -140,8 +140,11 @@ def prepare_session(media_id: str):
     id_token, access_token, refresh_token = extract_cookies_from_browser()
     assert id_token is not None, 'Unable to extract cognito tokens from cookies.'
 
-    user_agent = load_user_agent()
+    user_agent_original = load_user_agent()
+    user_agent = user_agent_original
     assert user_agent is not None, 'Unable to load user agent.'
+    user_agent_adjustment_original = 5
+    user_agent_adjustment = user_agent_adjustment_original
 
     api_key = load_config('webVideoOnDemandUiConf')
     assert api_key is not None, 'Unable to load API key.'
@@ -170,7 +173,10 @@ def prepare_session(media_id: str):
                     id_token, access_token, refresh_token = refresh_tokens(id_token, refresh_token)
                     continue
                 if error['reason'] == 'TOO_MANY_DEVICES':  # may error if chrome is in middle of updating
-                    user_agent = adjust_user_agent_version(user_agent, -1)
+                    user_agent = adjust_user_agent_version(user_agent_original, user_agent_adjustment) \
+                        if user_agent_adjustment >= -user_agent_adjustment_original else None  # only check x above and x below
+                    assert user_agent is not None, 'Fatal: TOO_MANY_DEVICES (possible blackout policy in your market)'
+                    user_agent_adjustment -= 1
                     continue
             pprint('\n\n', e.request, '\n\n', e.response, '\n\n')
             raise
@@ -211,11 +217,11 @@ def load_user_agent():
         if driver: driver.quit()
 
 
-def adjust_user_agent_version(user_agent: str, i: int):
+def adjust_user_agent_version(user_agent: str, offset: int):
     match = re.search(r'(Chrome/(\d+)\.0\.0\.0)', user_agent)
-    assert match and match.group(1) and match.group(2)
-    assert int(match.group(2)) > 101, 'Unable to adjust user agent version.'
-    return user_agent.replace(match.group(1), f'Chrome/{int(match.group(2)) + i}.0.0.0')
+    if not (match and match.group(1) and match.group(2)): return None
+    if not (int(match.group(2)) > 101): return None
+    return user_agent.replace(match.group(1), f'Chrome/{int(match.group(2)) + offset}.0.0.0')
 
 
 def load_config(key: str):

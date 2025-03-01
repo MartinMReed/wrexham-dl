@@ -1,4 +1,4 @@
-python-jose==3.3.0
+python-jose==3.4.0
 yt-dlp==2025.1.26
 selenium==4.28.1
 webdriver-manager==4.0.2
