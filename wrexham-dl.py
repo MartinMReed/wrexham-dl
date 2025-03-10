@@ -59,33 +59,7 @@ def download(media_id: str, *, media_type: str, ytdlp_options: dict = None):
 
         assert datetime.now(tz=timezone.utc) < schedule_end, 'Event has already ended.'
 
-        adjusted_start = schedule_start - timedelta(minutes=5)  # start 5 minutes early
-
-        strfunit = lambda i, unit: f"{floor(i)} {unit}{'' if floor(i) == 1 else 's'}"
-
-        while adjusted_start > datetime.now(tz=timezone.utc):
-            wait_remainder = (adjusted_start - datetime.now(tz=timezone.utc)).seconds
-            wait_hours, wait_remainder = divmod(wait_remainder, 3600)
-            wait_minutes, wait_seconds = divmod(wait_remainder, 60)
-
-            print(f"Waiting for event to start... {strfunit(wait_hours, 'hour')}, {strfunit(wait_minutes, 'minute')}, {strfunit(wait_seconds, 'second')}")
-
-            time.sleep(  # determines countdown interval based on remaining time
-                # 1s if <= 10s left
-                1 if wait_hours == 0 and wait_minutes == 0 and wait_seconds <= 10 else
-                # just enough time to reach 10s left if between 11-20s
-                (wait_seconds - 10) if wait_hours == 0 and wait_minutes == 0 and wait_seconds <= 20 else
-                # 10s if > 20s but within 1m
-                10 if wait_hours == 0 and wait_minutes == 0 else
-                # 1m if <= 10m left
-                60 if wait_hours == 0 and wait_minutes <= 10 else
-                # just enough time to reach 10m left if between 11-20m
-                (wait_minutes - 10) * 60 if wait_hours == 0 and wait_minutes <= 20 else
-                # 10m if > 20m but within 1h
-                600 if wait_hours == 0 else
-                # 1h otherwise
-                3600
-            )
+        wait_for_event_start(schedule_start)
 
         media_id = live_media_id
 
@@ -149,6 +123,12 @@ def prepare_session(media_id: str):
     api_key = load_config('webVideoOnDemandUiConf')
     assert api_key is not None, 'Unable to load API key.'
 
+    def _refresh_tokens():
+        nonlocal id_token, access_token, refresh_token
+        claims = jwt.get_unverified_claims(id_token)
+        assert int(claims['exp']) < timegm(datetime.now(tz=timezone.utc).utctimetuple()), 'Token has not expired, but is still invalid.'
+        id_token, access_token, refresh_token = refresh_tokens(id_token, refresh_token)
+
     while True:
         try:
 
@@ -165,19 +145,28 @@ def prepare_session(media_id: str):
             return response.json(), headers
 
         except RequestException as e:
-            if e.response.status_code == 401:
-                error = e.response.json()
-                if error['reason'] == 'BAD_REQUEST_ERROR' and error['message'] == 'jwt expired':
-                    claims = jwt.get_unverified_claims(id_token)
-                    assert int(claims['exp']) < timegm(datetime.now(tz=timezone.utc).utctimetuple()), 'Token has not expired, but is still invalid.'
-                    id_token, access_token, refresh_token = refresh_tokens(id_token, refresh_token)
-                    continue
-                if error['reason'] == 'TOO_MANY_DEVICES':  # may error if chrome is in middle of updating
-                    user_agent = adjust_user_agent_version(user_agent_original, user_agent_adjustment) \
-                        if user_agent_adjustment >= -user_agent_adjustment_original else None  # only check x above and x below
-                    assert user_agent is not None, 'Fatal: TOO_MANY_DEVICES (possible blackout policy in your market)'
-                    user_agent_adjustment -= 1
-                    continue
+            if 'application/json' in e.response.headers['content-type']:
+                response = e.response.json()
+                if e.response.status_code == 401:
+                    if response.get('reason') == 'BAD_REQUEST_ERROR' and response.get('message') == 'jwt expired':
+                        _refresh_tokens()
+                        continue
+                    if response.get('reason') == 'TOO_MANY_DEVICES':  # may error if chrome is in middle of updating
+                        user_agent = adjust_user_agent_version(user_agent_original, user_agent_adjustment) \
+                            if user_agent_adjustment >= -user_agent_adjustment_original else None  # only check x above and x below
+                        assert user_agent is not None, 'Fatal: TOO_MANY_DEVICES (possible blackout policy in your market)'
+                        # TODO: CHECK /ksession API
+                        # upcoming... "Status": -1
+                        # blocked...  "Status": 4, "ErrorMessage": "Customer has failed concurrency check"
+                        user_agent_adjustment -= 1
+                        continue
+                if e.response.status_code == 500:
+                    errors = response.get('errors')
+                    if errors and isinstance(errors, list):
+                        if 'token expired' in '\n'.join(errors).lower():
+                            _refresh_tokens()
+                            continue
+
             pprint('\n\n', e.request, '\n\n', e.response, '\n\n')
             raise
 
@@ -234,22 +223,15 @@ def load_config(key: str):
 def refresh_sso(id_token: str):
     claims = jwt.get_unverified_claims(id_token)
 
-    try:
+    requests.get(
+        url=f"https://sso.cms.web.gc.wrexhamafcservices.co.uk/v2/{claims['sub']}",
+        params={'token': id_token}
+    ).raise_for_status()
 
-        requests.get(
-            url=f"https://sso.cms.web.gc.wrexhamafcservices.co.uk/v2/{claims['sub']}",
-            params={'token': id_token}
-        ).raise_for_status()
-
-        requests.get(
-            url=f'https://wrexhampayments.streamamg.com/sso/start',
-            params={'token': id_token}
-        ).raise_for_status()
-
-    except RequestException as e:
-        if e.response.status_code not in (401, 403):
-            pprint('\n\n', e.request, '\n\n', e.response, '\n\n')
-        raise
+    requests.get(
+        url=f'https://wrexhampayments.streamamg.com/sso/start',
+        params={'token': id_token}
+    ).raise_for_status()
 
 
 def refresh_tokens(id_token: str, refresh_token: str):
@@ -271,6 +253,37 @@ def refresh_tokens(id_token: str, refresh_token: str):
         response['AuthenticationResult']['AccessToken'],
         response['AuthenticationResult']['RefreshToken']
     )
+
+
+def wait_for_event_start(schedule_start: datetime):
+    strfunit = lambda i, unit: f"{floor(i)} {unit}{'' if floor(i) == 1 else 's'}"
+
+    adjusted_start = schedule_start - timedelta(minutes=5)  # start 5 minutes early
+    print(f"Recording will start at: {adjusted_start.astimezone().strftime('%B %d, %-I:%M %p %Z')}")
+
+    while adjusted_start > datetime.now(tz=timezone.utc):
+        wait_remainder = adjusted_start.timestamp() - datetime.now(tz=timezone.utc).timestamp()
+        wait_hours, wait_remainder = divmod(wait_remainder, 3600)
+        wait_minutes, wait_seconds = divmod(wait_remainder, 60)
+
+        print(f"Waiting for event to start... {strfunit(wait_hours, 'hour')}, {strfunit(wait_minutes, 'minute')}, {strfunit(wait_seconds, 'second')}")
+
+        time.sleep(  # determines countdown interval based on remaining time
+            # 1s if <= 10s left
+            1 if wait_hours == 0 and wait_minutes == 0 and wait_seconds <= 10 else
+            # just enough time to reach 10s left if between 11-20s
+            (wait_seconds - 10) if wait_hours == 0 and wait_minutes == 0 and wait_seconds <= 20 else
+            # 10s if > 20s but within 1m
+            10 if wait_hours == 0 and wait_minutes == 0 else
+            # 1m if <= 10m left
+            60 if wait_hours == 0 and wait_minutes <= 10 else
+            # just enough time to reach 10m left if between 11-20m
+            (wait_minutes - 10) * 60 if wait_hours == 0 and wait_minutes <= 20 else
+            # 10m if > 20m but within 1h
+            600 if wait_hours == 0 else
+            # 1h otherwise
+            3600
+        )
 
 
 def pprint(*args):
@@ -312,5 +325,7 @@ if __name__ == '__main__':
                 no_warnings=False,
             )
         )
+    except KeyboardInterrupt:
+        pass
     except AssertionError as e:
         print(str(e))
